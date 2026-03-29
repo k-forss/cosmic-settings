@@ -20,6 +20,8 @@ clap = { version = "4.5.59", features = ["derive"] }
 color-eyre = "0.6.5"
 cosmic-bg-config.workspace = true
 cosmic-comp-config = { workspace = true, optional = true }
+# TODO: Replace with upstream git URL after calendar code is merged to pop-os/cosmic-applets
+cosmic-applets-config = { path = "../../cosmic-applets/cosmic-applets-config", optional = true }
 cosmic-config.workspace = true
 cosmic-dbus-networkmanager = { git = "https://github.com/pop-os/dbus-settings-bindings", optional = true }
 nm-secret-agent-manager = { git = "https://github.com/pop-os/dbus-settings-bindings", optional = true }
@@ -64,10 +66,14 @@ locale1 = { git = "https://github.com/pop-os/dbus-settings-bindings", optional =
 sysinfo = { version = "=0.38.0", optional = true }
 mime-apps = { package = "cosmic-mime-apps", git = "https://github.com/pop-os/cosmic-mime-apps", optional = true }
 notify = "8.2.0"
+openidconnect = { version = "3", optional = true }
+quick-xml = { version = "0.37", optional = true }
 regex = "1.12.3"
 ron = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"], optional = true }
 rust-embed = "8.11.0"
 sctk = { workspace = true, optional = true }
+secret-service = { version = "5", features = ["rt-tokio-crypto-rust"], optional = true }
 secure-string = "0.3.0"
 serde = { version = "1.0.228", features = ["derive"] }
 slab = "0.4.12"
@@ -121,6 +127,7 @@ linux = [
     "page-accessibility",
     "page-about",
     "page-bluetooth",
+    "page-calendar",
     "page-date",
     "page-default-apps",
     "page-display",
@@ -154,6 +161,14 @@ page-bluetooth = [
     "dep:bluez-zbus",
 ]
 page-date = ["dep:timedate-zbus", "dep:zbus"]
+page-calendar = [
+    "dep:cosmic-applets-config",
+    "dep:reqwest",
+    "dep:secret-service",
+    "dep:openidconnect",
+    "dep:quick-xml",
+    "xdg-portal",
+]
 page-default-apps = ["dep:cosmic-settings-config", "dep:mime-apps"]
 page-display = ["dep:udev"]
 page-input = [
