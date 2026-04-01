@@ -21,11 +21,13 @@ use cosmic::{
     widget::{self, settings, space},
 };
 use cosmic_applets_config::calendar::{
-    AuthMethod, CalDavCalendar, CalendarConfig, SourceConfig, SourceType, CALENDAR_CONFIG_ID,
+    AuthMethod, CalDavCalendar, CalendarConfig, EncryptionMode, SourceConfig, SourceType,
+    CALENDAR_CONFIG_ID,
 };
 use cosmic_settings_page::{self as page, Section, section};
 use slotmap::SlotMap;
 use tracing::error;
+use zeroize::Zeroizing;
 
 /// Color presets for calendar sources/calendars.
 const COLOR_PRESETS: &[&str] = &[
@@ -64,6 +66,8 @@ pub struct Page {
     // Discovery state (for already-saved sources)
     discovering_source: Option<String>,
     discovery_error: Option<String>,
+    /// Sources for which we already attempted a token refresh (prevents loops).
+    refresh_attempted: std::collections::HashSet<String>,
     // Per-calendar color editing
     editing_calendar_color: Option<(String, String)>, // (source_id, cal_href)
     calendar_color_input: String,
@@ -94,7 +98,7 @@ impl Default for Page {
             form_oidc_issuer: String::new(),
             form_oidc_client_id: String::new(),
             form_oidc_client_secret: String::new(),
-            form_oidc_scopes: String::new(),
+            form_oidc_scopes: String::from("openid, profile, email, offline_access"),
             form_ca_cert_path: String::new(),
             form_discovered_calendars: Vec::new(),
             form_discovering: false,
@@ -108,6 +112,7 @@ impl Default for Page {
             form_cal_color_input: String::new(),
             discovering_source: None,
             discovery_error: None,
+            refresh_attempted: std::collections::HashSet::new(),
             editing_calendar_color: None,
             calendar_color_input: String::new(),
         }
@@ -172,7 +177,7 @@ impl Page {
         self.form_oidc_issuer.clear();
         self.form_oidc_client_id.clear();
         self.form_oidc_client_secret.clear();
-        self.form_oidc_scopes.clear();
+        self.form_oidc_scopes = String::from("openid, profile, email, offline_access");
         self.form_ca_cert_path.clear();
         self.form_discovered_calendars.clear();
         self.form_discovering = false;
@@ -642,6 +647,7 @@ impl Page {
                             .await
                             .ok()
                             .flatten()
+                            .map(|z| String::from(z.as_str()))
                             .unwrap_or_default();
                             let creds = discovery::InlineCredentials::Bearer { token };
                             match discovery::discover_calendars_inline(
@@ -698,7 +704,7 @@ impl Page {
                 let current = self
                     .form_discovered_calendars
                     .get(idx)
-                    .and_then(|c| c.color.clone())
+                    .map(|c| c.color.clone())
                     .unwrap_or_else(|| "#1a73e8".to_string());
                 self.form_cal_color_input = current;
                 self.form_editing_cal_color = Some(idx);
@@ -712,7 +718,7 @@ impl Page {
                 self.form_cal_color_input = hex.clone();
                 if let Some(idx) = self.form_editing_cal_color {
                     if let Some(cal) = self.form_discovered_calendars.get_mut(idx) {
-                        cal.color = Some(hex);
+                        cal.color = hex;
                     }
                 }
             }
@@ -720,7 +726,7 @@ impl Page {
             Message::FormCalColorSave => {
                 if let Some(idx) = self.form_editing_cal_color {
                     if let Some(cal) = self.form_discovered_calendars.get_mut(idx) {
-                        cal.color = Some(self.form_cal_color_input.clone());
+                        cal.color = self.form_cal_color_input.clone();
                     }
                 }
                 self.form_editing_cal_color = None;
@@ -763,6 +769,82 @@ impl Page {
             Message::FormOidcLoginResult(result) => match result {
                 Ok((access_token, refresh_token)) => {
                     self.form_oidc_logged_in = true;
+
+                    // ── Auto-save the source after successful OIDC login ──
+                    if self.form_valid() && self.form_source_type == 0 {
+                        let scopes: Vec<String> = self
+                            .form_oidc_scopes
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        let auth = AuthMethod::Oidc {
+                            issuer_url: self.form_oidc_issuer.clone(),
+                            client_id: self.form_oidc_client_id.clone(),
+                            has_token: true,
+                            has_client_secret: !self.form_oidc_client_secret.is_empty(),
+                            scopes,
+                        };
+                        let source_type = SourceType::CalDav {
+                            url: self.form_url.clone(),
+                            auth,
+                            calendars: Vec::new(),
+                        };
+                        let mut source = SourceConfig::new(
+                            self.form_name.clone(),
+                            self.form_color.clone(),
+                            source_type,
+                        );
+                        source.id = self.form_source_id.clone();
+                        if !self.form_ca_cert_path.trim().is_empty() {
+                            source.ca_cert_path = Some(self.form_ca_cert_path.clone());
+                        }
+                        let source_id = source.id.clone();
+                        let client_secret = self.form_oidc_client_secret.clone();
+
+                        self.calendar_config.sources.push(source);
+                        self.save_config();
+                        self.reset_form();
+
+                        return cosmic::Task::future(async move {
+                            if let Err(e) = secrets::store_secret(
+                                &source_id,
+                                secrets::SecretKind::OidcAccessToken,
+                                &access_token,
+                            )
+                            .await
+                            {
+                                error!("Failed to store OIDC access token: {e}");
+                            }
+                            if let Some(rt) = &refresh_token {
+                                if let Err(e) = secrets::store_secret(
+                                    &source_id,
+                                    secrets::SecretKind::OidcRefreshToken,
+                                    rt,
+                                )
+                                .await
+                                {
+                                    error!("Failed to store OIDC refresh token: {e}");
+                                }
+                            }
+                            if !client_secret.is_empty() {
+                                if let Err(e) = secrets::store_secret(
+                                    &source_id,
+                                    secrets::SecretKind::OidcClientSecret,
+                                    &client_secret,
+                                )
+                                .await
+                                {
+                                    error!("Failed to store OIDC client secret: {e}");
+                                }
+                            }
+                            Message::OidcSavedAndDiscover(source_id, access_token)
+                        })
+                        .map(crate::pages::Message::Calendar)
+                        .map(crate::Message::PageMessage);
+                    }
+
+                    // Fallback: form not valid, just store tokens for later manual save
                     let sid = self.form_source_id.clone();
                     return cosmic::Task::future(async move {
                         if let Err(e) = secrets::store_secret(
@@ -795,6 +877,25 @@ impl Page {
                     self.form_discovery_error = Some(e);
                 }
             },
+
+            // ── OIDC auto-save complete: enter edit view + discover ──
+            Message::OidcSavedAndDiscover(source_id, _access_token) => {
+                // Enter edit mode for the newly saved source
+                if let Some(source) = self
+                    .calendar_config
+                    .sources
+                    .iter()
+                    .find(|s| s.id == source_id)
+                {
+                    let source = source.clone();
+                    self.reset_form();
+                    self.editing = true;
+                    self.editing_source_id = Some(source_id.clone());
+                    self.fill_form_from_source(&source);
+                }
+                // Discover via keyring roundtrip (tokens already stored)
+                return self.update(Message::Discover(source_id));
+            }
 
             // ── CalDAV discovery (saved sources) ───────────────
             Message::Discover(source_id) => {
@@ -843,12 +944,33 @@ impl Page {
                         }
                     }
                 }
+                self.refresh_attempted.remove(&source_id);
                 self.save_config();
             }
 
             Message::DiscoverError(source_id, err) => {
                 self.discovering_source = None;
                 error!("Discovery failed for {source_id}: {err}");
+
+                // If auth expired and source uses OIDC, try refreshing the token
+                if err.contains("Authentication expired") || err.contains("expired") {
+                    let is_oidc = self
+                        .calendar_config
+                        .sources
+                        .iter()
+                        .find(|s| s.id == source_id)
+                        .map(|s| matches!(&s.source_type,
+                            SourceType::CalDav { auth: AuthMethod::Oidc { .. }, .. }
+                            | SourceType::IcsUrl { auth: AuthMethod::Oidc { .. }, .. }
+                        ))
+                        .unwrap_or(false);
+
+                    if is_oidc && !self.refresh_attempted.contains(&source_id) {
+                        self.refresh_attempted.insert(source_id.clone());
+                        return self.update(Message::OidcRefresh(source_id));
+                    }
+                }
+
                 self.discovery_error = Some(err);
             }
 
@@ -881,7 +1003,7 @@ impl Page {
                             calendars
                                 .iter()
                                 .find(|c| c.href == cal_href)
-                                .and_then(|c| c.color.clone())
+                                .map(|c| c.color.clone())
                                 .or_else(|| Some(s.color.clone()))
                         } else {
                             None
@@ -908,7 +1030,7 @@ impl Page {
                     {
                         if let SourceType::CalDav { calendars, .. } = &mut src.source_type {
                             if let Some(cal) = calendars.iter_mut().find(|c| c.href == *cal_href) {
-                                cal.color = Some(hex);
+                                cal.color = hex;
                             }
                         }
                     }
@@ -926,7 +1048,7 @@ impl Page {
                     {
                         if let SourceType::CalDav { calendars, .. } = &mut src.source_type {
                             if let Some(cal) = calendars.iter_mut().find(|c| c.href == *cal_href) {
-                                cal.color = Some(self.calendar_color_input.clone());
+                                cal.color = self.calendar_color_input.clone();
                             }
                         }
                     }
@@ -990,7 +1112,7 @@ impl Page {
                         let result = auth::oidc_login(
                             &issuer,
                             &client,
-                            secret.as_deref(),
+                            secret.as_deref().map(String::as_str),
                             &scopes,
                         )
                         .await
@@ -1020,9 +1142,14 @@ impl Page {
                         }
                     }
                     self.save_config();
+                    self.refresh_attempted.remove(&source_id);
+                    self.discovery_error = None;
 
+                    // Store tokens then discover via keyring roundtrip
                     let sid = source_id;
                     return cosmic::Task::future(async move {
+                        let access_token = Zeroizing::new(access_token);
+                        let refresh_token = refresh_token.map(Zeroizing::new);
                         if let Err(e) = secrets::store_secret(
                             &sid,
                             secrets::SecretKind::OidcAccessToken,
@@ -1032,7 +1159,7 @@ impl Page {
                         {
                             error!("Failed to store OIDC access token: {e}");
                         }
-                        if let Some(rt) = &refresh_token {
+                        if let Some(ref rt) = refresh_token {
                             if let Err(e) = secrets::store_secret(
                                 &sid,
                                 secrets::SecretKind::OidcRefreshToken,
@@ -1043,13 +1170,113 @@ impl Page {
                                 error!("Failed to store OIDC refresh token: {e}");
                             }
                         }
-                        Message::ConfigReload
+                        Message::Discover(sid)
                     })
                     .map(crate::pages::Message::Calendar)
                     .map(crate::Message::PageMessage);
                 }
                 Err(e) => {
                     error!("OIDC login failed: {e}");
+                }
+            },
+
+            // ── OIDC token refresh (automatic on auth-expired) ──
+            Message::OidcRefresh(source_id) => {
+                let oidc_info = self
+                    .calendar_config
+                    .sources
+                    .iter()
+                    .find(|s| s.id == source_id)
+                    .and_then(|s| match &s.source_type {
+                        SourceType::CalDav {
+                            auth: AuthMethod::Oidc { issuer_url, client_id, has_client_secret, .. }, ..
+                        }
+                        | SourceType::IcsUrl {
+                            auth: AuthMethod::Oidc { issuer_url, client_id, has_client_secret, .. }, ..
+                        } => Some((issuer_url.clone(), client_id.clone(), *has_client_secret)),
+                        _ => None,
+                    });
+
+                if let Some((issuer, client_id, needs_secret)) = oidc_info {
+                    let sid = source_id;
+                    return cosmic::Task::future(async move {
+                        // Load refresh token from keyring
+                        let refresh_token = secrets::load_secret(&sid, secrets::SecretKind::OidcRefreshToken)
+                            .await
+                            .ok()
+                            .flatten();
+                        let Some(rt) = refresh_token else {
+                            return Message::OidcRefreshResult(Err(format!(
+                                "No refresh token stored for {sid}"
+                            )));
+                        };
+                        let secret = if needs_secret {
+                            secrets::load_secret(&sid, secrets::SecretKind::OidcClientSecret)
+                                .await
+                                .ok()
+                                .flatten()
+                        } else {
+                            None
+                        };
+                        match auth::oidc_refresh(&issuer, &client_id, secret.as_deref().map(String::as_str), &rt).await {
+                            Ok(tokens) => Message::OidcRefreshResult(Ok((
+                                sid,
+                                tokens.access_token,
+                                tokens.refresh_token,
+                            ))),
+                            Err(e) => Message::OidcRefreshResult(Err(format!("{sid}: {e}"))),
+                        }
+                    })
+                    .map(crate::pages::Message::Calendar)
+                    .map(crate::Message::PageMessage);
+                }
+            }
+
+            Message::OidcRefreshResult(result) => match result {
+                Ok((source_id, access_token, refresh_token)) => {
+                    tracing::info!("Token refresh succeeded for {source_id}");
+                    self.discovery_error = None;
+
+                    // Store tokens then discover via keyring roundtrip
+                    let sid = source_id;
+                    return cosmic::Task::future(async move {
+                        let access_token = Zeroizing::new(access_token);
+                        let refresh_token = refresh_token.map(Zeroizing::new);
+                        if let Err(e) = secrets::store_secret(
+                            &sid,
+                            secrets::SecretKind::OidcAccessToken,
+                            &access_token,
+                        )
+                        .await
+                        {
+                            error!("Failed to store refreshed access token: {e}");
+                        }
+                        if let Some(ref rt) = refresh_token {
+                            if let Err(e) = secrets::store_secret(
+                                &sid,
+                                secrets::SecretKind::OidcRefreshToken,
+                                rt,
+                            )
+                            .await
+                            {
+                                error!("Failed to store refreshed refresh token: {e}");
+                            }
+                        }
+                        Message::Discover(sid)
+                    })
+                    .map(crate::pages::Message::Calendar)
+                    .map(crate::Message::PageMessage);
+                }
+                Err(e) => {
+                    error!("Token refresh failed, full re-auth needed: {e}");
+                    // Extract source_id from error message prefix
+                    let source_id = e.split(':').next().unwrap_or("").trim().to_string();
+                    if !source_id.is_empty() {
+                        self.discovery_error = Some(fl!("calendar-auth-expired-reauth"));
+                        // Trigger full re-auth
+                        return self.update(Message::OidcLogin(source_id));
+                    }
+                    self.discovery_error = Some(e);
                 }
             },
 
@@ -1062,6 +1289,20 @@ impl Page {
             Message::UpcomingCount(v) => {
                 self.calendar_config.upcoming_count = v;
                 self.save_config();
+            }
+
+            Message::EncryptionModeChanged(v) => {
+                let new_mode = match v {
+                    0 => EncryptionMode::None,
+                    1 => EncryptionMode::Auto,
+                    _ => EncryptionMode::Manual,
+                };
+                if self.calendar_config.encryption_mode != new_mode {
+                    self.calendar_config.encryption_mode = new_mode;
+                    self.save_config();
+                    // Delete old cache files so next sync rebuilds with new mode
+                    delete_calendar_cache();
+                }
             }
 
 
@@ -1117,6 +1358,9 @@ pub enum Message {
     FormCalColorCancel,
     FormOidcLogin,
     FormOidcLoginResult(Result<(String, Option<String>), String>),
+    /// After OIDC login saved the source: enter edit view + discover calendars.
+    /// Carries (source_id, access_token) so discovery can use inline credentials.
+    OidcSavedAndDiscover(String, String),
     // Discovery (for already-saved sources)
     Discover(String),
     Discovered(String, Vec<CalDavCalendar>),
@@ -1131,9 +1375,14 @@ pub enum Message {
     // OIDC
     OidcLogin(String),
     OidcResult(Result<(String, String, Option<String>), String>),
+    /// Attempt to refresh OIDC tokens for a source, then retry discovery.
+    OidcRefresh(String),
+    /// Result of token refresh: Ok((source_id, access_token, refresh_token)) or Err.
+    OidcRefreshResult(Result<(String, String, Option<String>), String>),
     // Sync settings
-    SyncInterval(u32),
+    SyncInterval(u64),
     UpcomingCount(usize),
+    EncryptionModeChanged(usize),
     // Config reload
     ConfigReload,
 }
@@ -1149,6 +1398,13 @@ fn sources_section() -> Section<crate::pages::Message> {
         .title(fl!("calendar-sources"))
         .descriptions(descriptions)
         .view::<Page>(move |_binder, page, section| {
+            // Hide when editing — the form section takes the full page
+            if page.editing {
+                return widget::column::with_capacity(0)
+                    .apply(cosmic::Element::from)
+                    .map(crate::pages::Message::Calendar);
+            }
+
             let mut section_content = settings::section().title(&section.title);
 
             if page.calendar_config.sources.is_empty() {
@@ -1176,7 +1432,13 @@ fn sources_section() -> Section<crate::pages::Message> {
                     let edit_id = source_id.clone();
                     let remove_id = source_id.clone();
 
-                    let mut controls = widget::row::with_capacity(4)
+                    // Check if this source uses OIDC auth
+                    let is_oidc = matches!(&source.source_type,
+                        SourceType::CalDav { auth: AuthMethod::Oidc { .. }, .. }
+                        | SourceType::IcsUrl { auth: AuthMethod::Oidc { .. }, .. }
+                    );
+
+                    let mut controls = widget::row::with_capacity(5)
                         .spacing(8);
 
                     if !is_caldav {
@@ -1186,13 +1448,33 @@ fn sources_section() -> Section<crate::pages::Message> {
                         controls = controls.push(color_indicator);
                     }
 
+                    // Re-auth button for OIDC sources
+                    if is_oidc {
+                        let reauth_id = source_id.clone();
+                        controls = controls.push(
+                            widget::button::icon(widget::icon::from_name("system-lock-screen-symbolic"))
+                                .on_press(Message::OidcLogin(reauth_id)),
+                        );
+                    }
+
+                    // Discover button for CalDAV sources without calendars
+                    if let SourceType::CalDav { calendars, .. } = &source.source_type {
+                        if calendars.is_empty() {
+                            let discover_id = source_id.clone();
+                            controls = controls.push(
+                                widget::button::icon(widget::icon::from_name("view-refresh-symbolic"))
+                                    .on_press(Message::Discover(discover_id)),
+                            );
+                        }
+                    }
+
                     controls = controls
                         .push(
                             widget::toggler(source.enabled)
                                 .on_toggle(move |_| Message::ToggleSource(toggle_id.clone())),
                         )
                         .push(
-                            widget::button::icon(widget::icon::from_name("document-edit-symbolic"))
+                            widget::button::icon(widget::icon::from_name("edit-symbolic"))
                             .on_press(Message::EditSource(edit_id)),
                         )
                         .push(
@@ -1209,10 +1491,11 @@ fn sources_section() -> Section<crate::pages::Message> {
                     // Show CalDAV calendars
                     if let SourceType::CalDav { calendars, .. } = &source.source_type {
                         for cal in calendars {
-                            let cal_color = cal
-                                .color
-                                .as_deref()
-                                .unwrap_or(&source.color);
+                            let cal_color = if cal.color.is_empty() {
+                                &source.color
+                            } else {
+                                &cal.color
+                            };
                             let cal_color_parsed = parse_hex_color(cal_color);
                             let cal_indicator =
                                 widget::container(widget::Space::new().width(10).height(10))
@@ -1562,10 +1845,9 @@ fn source_form_section() -> Section<crate::pages::Message> {
                         );
                         section_content = section_content.add(
                             settings::item::builder(fl!("calendar-source-oidc-client-secret"))
-                                .description(fl!("calendar-source-oidc-client-secret-hint"))
                                 .control(
                                     widget::text_input(
-                                        fl!("calendar-source-oidc-client-secret"),
+                                        fl!("calendar-source-oidc-client-secret-hint"),
                                         &page.form_oidc_client_secret,
                                     )
                                     .on_input(Message::FormOidcClientSecret)
@@ -1582,6 +1864,12 @@ fn source_form_section() -> Section<crate::pages::Message> {
                                 .on_input(Message::FormOidcScopes)
                                 .width(Length::Fixed(300.0)),
                             ),
+                        );
+                        section_content = section_content.add(
+                            settings::item::builder(fl!("calendar-source-oidc-callback-url"))
+                                .control(
+                                    widget::text::body(fl!("calendar-source-oidc-callback-pattern")),
+                                ),
                         );
                     }
                     _ => {}
@@ -1637,7 +1925,8 @@ fn source_form_section() -> Section<crate::pages::Message> {
                             ),
                     ),
                 );
-            }── CalDAV two-stage: discover then configure calendars ──
+            }
+            // ── CalDAV two-stage: discover then configure calendars ──
             if page.form_source_type == 0 && !is_edit {
                 // Discovery error
                 if let Some(ref err) = page.form_discovery_error {
@@ -1689,10 +1978,11 @@ fn source_form_section() -> Section<crate::pages::Message> {
                 } else {
                     // Show discovered calendars with toggles and color pickers
                     for (idx, cal) in page.form_discovered_calendars.iter().enumerate() {
-                        let cal_color = cal
-                            .color
-                            .as_deref()
-                            .unwrap_or("#1a73e8");
+                        let cal_color = if cal.color.is_empty() {
+                            "#1a73e8"
+                        } else {
+                            &cal.color
+                        };
                         let cal_color_parsed = parse_hex_color(cal_color);
                         let cal_indicator =
                             widget::container(widget::Space::new().width(10).height(10))
@@ -1800,30 +2090,179 @@ fn source_form_section() -> Section<crate::pages::Message> {
                     );
                 }
             } else {
-                // ICS sources or edit mode: simple Save / Cancel
-                let save_msg = if is_edit {
-                    Message::SaveEditSource
+                // ── Edit mode (CalDAV): show calendars + discover ──
+                if is_edit && page.form_source_type == 0 {
+                    // Show existing calendars from the source being edited
+                    if let Some(src) = page
+                        .calendar_config
+                        .sources
+                        .iter()
+                        .find(|s| s.id.as_str() == page.editing_source_id.as_deref().unwrap_or(""))
+                    {
+                        if let SourceType::CalDav { calendars, .. } = &src.source_type {
+                            if !calendars.is_empty() {
+                                section_content = section_content.add(
+                                    settings::item::builder(fl!("calendar-sources"))
+                                        .control(space::horizontal()),
+                                );
+                            }
+                            for cal in calendars {
+                                let cal_color = if cal.color.is_empty() {
+                                    &src.color
+                                } else {
+                                    &cal.color
+                                };
+                                let cal_color_parsed = parse_hex_color(cal_color);
+                                let cal_indicator =
+                                    widget::container(widget::Space::new().width(10).height(10))
+                                        .class(color_swatch_class(cal_color_parsed));
+
+                                let src_id = src.id.clone();
+                                let cal_href = cal.href.clone();
+                                let color_src_id = src.id.clone();
+                                let color_cal_href = cal.href.clone();
+
+                                let cal_controls = widget::row::with_capacity(3)
+                                    .spacing(8)
+                                    .push(cal_indicator)
+                                    .push(
+                                        widget::toggler(cal.enabled).on_toggle(move |_| {
+                                            Message::ToggleCalendar(
+                                                src_id.clone(),
+                                                cal_href.clone(),
+                                            )
+                                        }),
+                                    )
+                                    .push(
+                                        widget::button::icon(widget::icon::from_name(
+                                            "preferences-color-symbolic",
+                                        ))
+                                        .on_press(Message::EditCalendarColor(
+                                            color_src_id,
+                                            color_cal_href,
+                                        )),
+                                    );
+
+                                section_content = section_content.add(
+                                    settings::item::builder(&cal.display_name)
+                                        .control(cal_controls),
+                                );
+
+                                // Per-calendar color editing inline
+                                if let Some((ref edit_sid, ref edit_href)) =
+                                    page.editing_calendar_color
+                                {
+                                    if edit_sid == &src.id && edit_href == &cal.href {
+                                        let mut color_row =
+                                            widget::row::with_capacity(COLOR_PRESETS.len() + 2)
+                                                .spacing(4);
+
+                                        for &hex in COLOR_PRESETS {
+                                            let hex_color = parse_hex_color(hex);
+                                            let swatch = widget::container(
+                                                widget::Space::new().width(20).height(20),
+                                            )
+                                            .class(color_swatch_class(hex_color))
+                                            .apply(widget::button::custom)
+                                            .class(if page.calendar_color_input == hex {
+                                                cosmic::theme::Button::Suggested
+                                            } else {
+                                                cosmic::theme::Button::Standard
+                                            })
+                                            .padding(2)
+                                            .on_press(Message::CalendarColorPreset(hex.to_string()));
+
+                                            color_row = color_row.push(swatch);
+                                        }
+
+                                        let input = widget::text_input(
+                                            fl!("calendar-source-color"),
+                                            &page.calendar_color_input,
+                                        )
+                                        .on_input(Message::CalendarColorInput)
+                                        .width(Length::Fixed(100.0));
+
+                                        let save_btn = widget::button::standard(fl!("calendar-save"))
+                                            .on_press(Message::SaveCalendarColor);
+                                        let cancel_btn =
+                                            widget::button::standard(fl!("calendar-cancel"))
+                                                .on_press(Message::CancelCalendarColor);
+
+                                        let controls_row = widget::row::with_capacity(3)
+                                            .spacing(8)
+                                            .push(input)
+                                            .push(save_btn)
+                                            .push(cancel_btn);
+
+                                        section_content = section_content.add(
+                                            settings::item::builder("").control(
+                                                widget::column::with_capacity(2)
+                                                    .spacing(4)
+                                                    .push(color_row)
+                                                    .push(controls_row),
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Discover button
+                    let edit_id = page.editing_source_id.clone().unwrap_or_default();
+                    let is_discovering =
+                        page.discovering_source.as_deref() == Some(edit_id.as_str());
+                    let discover_label = if is_discovering {
+                        fl!("calendar-discovering")
+                    } else {
+                        fl!("calendar-discover")
+                    };
+                    let mut discover_btn = widget::button::standard(discover_label);
+                    if !is_discovering && page.form_valid() {
+                        discover_btn = discover_btn.on_press(Message::Discover(edit_id));
+                    }
+
+                    // Save / Cancel / Discover
+                    let mut save_btn = widget::button::suggested(fl!("calendar-save"));
+                    if page.form_valid() {
+                        save_btn = save_btn.on_press(Message::SaveEditSource);
+                    }
+                    section_content = section_content.add(
+                        settings::item::builder("").control(
+                            widget::row::with_capacity(3)
+                                .spacing(8)
+                                .push(save_btn)
+                                .push(discover_btn)
+                                .push(
+                                    widget::button::standard(fl!("calendar-cancel"))
+                                        .on_press(Message::CancelForm),
+                                ),
+                        ),
+                    );
                 } else {
-                    Message::SaveSource
-                };
-                let mut save_btn = widget::button::suggested(fl!("calendar-save"));
-                if page.form_valid() {
-                    save_btn = save_btn.on_press(save_msg);
+                    // ICS sources or new ICS source: simple Save / Cancel
+                    let save_msg = if is_edit {
+                        Message::SaveEditSource
+                    } else {
+                        Message::SaveSource
+                    };
+                    let mut save_btn = widget::button::suggested(fl!("calendar-save"));
+                    if page.form_valid() {
+                        save_btn = save_btn.on_press(save_msg);
+                    }
+                    section_content = section_content.add(
+                        settings::item::builder("").control(
+                            widget::row::with_capacity(2)
+                                .spacing(8)
+                                .push(save_btn)
+                                .push(
+                                    widget::button::standard(fl!("calendar-cancel"))
+                                        .on_press(Message::CancelForm),
+                                ),
+                        ),
+                    );
                 }
-                section_content = section_content.add(
-                    settings::item::builder("").control(
-                        widget::row::with_capacity(2)
-                            .spacing(8)
-                            .push(save_btn)
-                            .push(
-                                widget::button::standard(fl!("calendar-cancel"))
-                                    .on_press(Message::CancelForm),
-                            ),
-                    ),
-                );
-            }          ),
-                ),
-            );
+            }
 
             section_content
                 .apply(cosmic::Element::from)
@@ -1841,6 +2280,13 @@ fn sync_settings_section() -> Section<crate::pages::Message> {
         .title(fl!("calendar-sync-settings"))
         .descriptions(descriptions)
         .view::<Page>(move |_binder, page, section| {
+            // Hide when editing — the form section takes the full page
+            if page.editing {
+                return widget::column::with_capacity(0)
+                    .apply(cosmic::Element::from)
+                    .map(crate::pages::Message::Calendar);
+            }
+
             let mut section_content = settings::section().title(&section.title);
 
             // Sync interval - use spin_button for numeric values
@@ -1873,10 +2319,58 @@ fn sync_settings_section() -> Section<crate::pages::Message> {
                 ),
             );
 
+            // Encryption mode selector
+            let current_mode = match page.calendar_config.encryption_mode {
+                EncryptionMode::None => 0,
+                EncryptionMode::Auto => 1,
+                EncryptionMode::Manual => 2,
+            };
+            let mode_labels = [
+                fl!("calendar-encryption-none"),
+                fl!("calendar-encryption-auto"),
+                fl!("calendar-encryption-manual"),
+            ];
+            let mut mode_row = widget::row::with_capacity(3).spacing(4);
+            for (i, label) in mode_labels.iter().enumerate() {
+                let btn = if i == current_mode {
+                    widget::button::suggested(label.clone())
+                } else {
+                    widget::button::standard(label.clone())
+                }
+                .on_press(Message::EncryptionModeChanged(i));
+                mode_row = mode_row.push(btn);
+            }
+            section_content = section_content.add(
+                settings::item::builder(fl!("calendar-encryption-mode")).control(mode_row),
+            );
+
             section_content
                 .apply(cosmic::Element::from)
                 .map(crate::pages::Message::Calendar)
         })
+}
+
+// ── Cache cleanup ──────────────────────────────────────────────────
+
+/// Delete calendar cache files so the next sync rebuilds them.
+fn delete_calendar_cache() {
+    let config_dir = std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| std::path::PathBuf::from(h).join(".config"))
+        });
+    if let Some(dir) = config_dir {
+        let base = dir
+            .join("cosmic")
+            .join("com.system76.CosmicAppletTime.Calendar")
+            .join("v1");
+        let _ = std::fs::remove_file(base.join("event_cache.json"));
+        let _ = std::fs::remove_file(base.join("ctag_cache.json"));
+    }
 }
 
 // ── Color swatch container style ───────────────────────────────────
@@ -1908,4 +2402,89 @@ fn color_swatch_class(color: cosmic::iced::Color) -> cosmic::theme::Container<'s
             snap: false,
         }
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_page() -> Page {
+        Page {
+            entity: page::Entity::default(),
+            calendar_config: CalendarConfig::default(),
+            config_handle: None,
+            editing: false,
+            editing_source_id: None,
+            form_name: String::new(),
+            form_url: String::new(),
+            form_source_type: 0,
+            form_auth_method: 0,
+            form_username: String::new(),
+            form_password: String::new(),
+            form_token: String::new(),
+            form_color: "#1a73e8".into(),
+            form_oidc_issuer: String::new(),
+            form_oidc_client_id: String::new(),
+            form_oidc_client_secret: String::new(),
+            form_oidc_scopes: "openid".into(),
+            form_ca_cert_path: String::new(),
+            form_discovered_calendars: Vec::new(),
+            form_discovering: false,
+            form_discovery_error: None,
+            form_source_id: "test-form".into(),
+            form_oidc_logged_in: false,
+            form_editing_cal_color: None,
+            form_cal_color_input: String::new(),
+            discovering_source: None,
+            discovery_error: None,
+            refresh_attempted: std::collections::HashSet::new(),
+            editing_calendar_color: None,
+            calendar_color_input: String::new(),
+        }
+    }
+
+    #[test]
+    fn form_valid_empty_name() {
+        let mut p = test_page();
+        p.form_name = "".into();
+        p.form_url = "https://dav.example.com".into();
+        p.form_source_type = 0;
+        assert!(!p.form_valid());
+    }
+
+    #[test]
+    fn form_valid_caldav_invalid_url() {
+        let mut p = test_page();
+        p.form_name = "My Calendar".into();
+        p.form_url = "ftp://bad-scheme.com".into();
+        p.form_source_type = 0;
+        assert!(!p.form_valid());
+    }
+
+    #[test]
+    fn form_valid_caldav_valid() {
+        let mut p = test_page();
+        p.form_name = "My Calendar".into();
+        p.form_url = "https://dav.example.com/calendars/".into();
+        p.form_source_type = 0;
+        assert!(p.form_valid());
+    }
+
+    #[test]
+    fn form_valid_ics_url_valid() {
+        let mut p = test_page();
+        p.form_name = "ICS Feed".into();
+        p.form_url = "https://example.com/feed.ics".into();
+        p.form_source_type = 1; // ICS URL
+        assert!(p.form_valid());
+    }
+
+    #[test]
+    fn form_valid_ics_file_nonexistent() {
+        let mut p = test_page();
+        p.form_name = "Local File".into();
+        p.form_url = "/nonexistent/path/to/calendar.ics".into();
+        p.form_source_type = 2; // ICS File
+        assert!(!p.form_valid());
+    }
 }
