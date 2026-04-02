@@ -128,8 +128,7 @@ async fn apply_auth(
                 })?
                 .ok_or_else(|| DiscoveryError::AuthExpired(source_id.to_string()))?;
             tracing::debug!(
-                "Using OIDC Bearer token from keyring for {source_id}: prefix={:.20}...",
-                token.as_str()
+                "Using OIDC Bearer token from keyring for {source_id}: token successfully loaded"
             );
             request.bearer_auth(token.as_str())
         }

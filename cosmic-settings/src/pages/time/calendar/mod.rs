@@ -9,8 +9,6 @@ mod auth;
 mod discovery;
 mod secrets;
 
-use std::sync::Arc;
-
 #[cfg(feature = "xdg-portal")]
 use cosmic::dialog::file_chooser;
 
@@ -47,12 +45,12 @@ pub struct Page {
     form_source_type: usize,
     form_auth_method: usize,
     form_username: String,
-    form_password: String,
-    form_token: String,
+    form_password: Zeroizing<String>,
+    form_token: Zeroizing<String>,
     form_color: String,
     form_oidc_issuer: String,
     form_oidc_client_id: String,
-    form_oidc_client_secret: String,
+    form_oidc_client_secret: Zeroizing<String>,
     form_oidc_scopes: String,
     form_ca_cert_path: String,
     // Form-level discovery state (two-stage CalDAV add)
@@ -92,12 +90,12 @@ impl Default for Page {
             form_source_type: 0,
             form_auth_method: 0,
             form_username: String::new(),
-            form_password: String::new(),
-            form_token: String::new(),
+            form_password: Zeroizing::new(String::new()),
+            form_token: Zeroizing::new(String::new()),
             form_color: String::from("#1a73e8"),
             form_oidc_issuer: String::new(),
             form_oidc_client_id: String::new(),
-            form_oidc_client_secret: String::new(),
+            form_oidc_client_secret: Zeroizing::new(String::new()),
             form_oidc_scopes: String::from("openid, profile, email, offline_access"),
             form_ca_cert_path: String::new(),
             form_discovered_calendars: Vec::new(),
@@ -308,6 +306,12 @@ impl Page {
                 if !self.form_valid() {
                     return Task::none();
                 }
+                // Auth-specific validation: require credentials for auth methods that need them
+                match self.form_auth_method {
+                    1 if self.form_username.trim().is_empty() => return Task::none(),
+                    2 if self.form_token.trim().is_empty() => return Task::none(),
+                    _ => {}
+                }
 
                 let scopes: Vec<String> = self
                     .form_oidc_scopes
@@ -366,13 +370,13 @@ impl Page {
 
                 return cosmic::Task::future(async move {
                     let result = match auth_method {
-                        1 => secrets::store_secret(
+                        1 if !password.is_empty() => secrets::store_secret(
                             &source_id,
                             secrets::SecretKind::Password,
                             &password,
                         )
                         .await,
-                        2 => secrets::store_secret(
+                        2 if !token.is_empty() => secrets::store_secret(
                             &source_id,
                             secrets::SecretKind::BearerToken,
                             &token,
@@ -571,12 +575,12 @@ impl Page {
             Message::FormSourceType(v) => self.form_source_type = v,
             Message::FormAuth(v) => self.form_auth_method = v,
             Message::FormUsername(v) => self.form_username = v,
-            Message::FormPassword(v) => self.form_password = v,
-            Message::FormToken(v) => self.form_token = v,
+            Message::FormPassword(v) => self.form_password = Zeroizing::new(v),
+            Message::FormToken(v) => self.form_token = Zeroizing::new(v),
             Message::FormColor(v) => self.form_color = v,
             Message::FormOidcIssuer(v) => self.form_oidc_issuer = v,
             Message::FormOidcClientId(v) => self.form_oidc_client_id = v,
-            Message::FormOidcClientSecret(v) => self.form_oidc_client_secret = v,
+            Message::FormOidcClientSecret(v) => self.form_oidc_client_secret = Zeroizing::new(v),
             Message::FormOidcScopes(v) => self.form_oidc_scopes = v,
             Message::FormCaCertPath(v) => self.form_ca_cert_path = v,
 
@@ -591,14 +595,14 @@ impl Page {
                     let mapped = result
                         .map(|resp| resp.url().to_owned())
                         .map_err(|e| e.to_string());
-                    Message::CaCertBrowsed(Arc::new(mapped))
+                    Message::CaCertBrowsed(mapped)
                 })
                 .map(crate::pages::Message::Calendar)
                 .map(crate::Message::PageMessage);
             }
 
             Message::CaCertBrowsed(result) => {
-                if let Ok(url) = Arc::into_inner(result).unwrap_or(Err(String::new())) {
+                if let Ok(url) = result {
                     if let Ok(path) = url.to_file_path() {
                         self.form_ca_cert_path = path.to_string_lossy().into_owned();
                     }
@@ -624,10 +628,10 @@ impl Page {
                 let credentials = match self.form_auth_method {
                     1 => discovery::InlineCredentials::Basic {
                         username: self.form_username.clone(),
-                        password: self.form_password.clone(),
+                        password: self.form_password.as_str().to_owned(),
                     },
                     2 => discovery::InlineCredentials::Bearer {
-                        token: self.form_token.clone(),
+                        token: self.form_token.as_str().to_owned(),
                     },
                     3 => {
                         // OIDC: must have logged in first; use stored access token
@@ -739,10 +743,10 @@ impl Page {
             Message::FormOidcLogin => {
                 let issuer = self.form_oidc_issuer.clone();
                 let client_id = self.form_oidc_client_id.clone();
-                let client_secret = if self.form_oidc_client_secret.is_empty() {
+                let client_secret: Option<String> = if self.form_oidc_client_secret.is_empty() {
                     None
                 } else {
-                    Some(self.form_oidc_client_secret.clone())
+                    Some(self.form_oidc_client_secret.as_str().to_owned())
                 };
                 let scopes: Vec<String> = self
                     .form_oidc_scopes
@@ -838,7 +842,7 @@ impl Page {
                                     error!("Failed to store OIDC client secret: {e}");
                                 }
                             }
-                            Message::OidcSavedAndDiscover(source_id, access_token)
+                            Message::OidcSavedAndDiscover(source_id)
                         })
                         .map(crate::pages::Message::Calendar)
                         .map(crate::Message::PageMessage);
@@ -879,7 +883,7 @@ impl Page {
             },
 
             // ── OIDC auto-save complete: enter edit view + discover ──
-            Message::OidcSavedAndDiscover(source_id, _access_token) => {
+            Message::OidcSavedAndDiscover(source_id) => {
                 // Enter edit mode for the newly saved source
                 if let Some(source) = self
                     .calendar_config
@@ -1345,7 +1349,7 @@ pub enum Message {
     FormOidcScopes(String),
     FormCaCertPath(String),
     BrowseCaCert,
-    CaCertBrowsed(Arc<Result<url::Url, String>>),
+    CaCertBrowsed(Result<url::Url, String>),
     // Form-level discovery (two-stage CalDAV add)
     FormDiscover,
     FormDiscovered(Vec<CalDavCalendar>),
@@ -1359,8 +1363,7 @@ pub enum Message {
     FormOidcLogin,
     FormOidcLoginResult(Result<(String, Option<String>), String>),
     /// After OIDC login saved the source: enter edit view + discover calendars.
-    /// Carries (source_id, access_token) so discovery can use inline credentials.
-    OidcSavedAndDiscover(String, String),
+    OidcSavedAndDiscover(String),
     // Discovery (for already-saved sources)
     Discover(String),
     Discovered(String, Vec<CalDavCalendar>),
@@ -1801,7 +1804,7 @@ fn source_form_section() -> Section<crate::pages::Message> {
                             settings::item::builder(fl!("calendar-source-password")).control(
                                 widget::text_input(
                                     fl!("calendar-source-password"),
-                                    &page.form_password,
+                                    page.form_password.as_str(),
                                 )
                                 .on_input(Message::FormPassword)
                                 .password()
@@ -1814,7 +1817,7 @@ fn source_form_section() -> Section<crate::pages::Message> {
                             settings::item::builder(fl!("calendar-source-token")).control(
                                 widget::text_input(
                                     fl!("calendar-source-token"),
-                                    &page.form_token,
+                                    page.form_token.as_str(),
                                 )
                                 .on_input(Message::FormToken)
                                 .password()
@@ -1848,7 +1851,7 @@ fn source_form_section() -> Section<crate::pages::Message> {
                                 .control(
                                     widget::text_input(
                                         fl!("calendar-source-oidc-client-secret-hint"),
-                                        &page.form_oidc_client_secret,
+                                        page.form_oidc_client_secret.as_str(),
                                     )
                                     .on_input(Message::FormOidcClientSecret)
                                     .password()
@@ -2420,12 +2423,12 @@ mod tests {
             form_source_type: 0,
             form_auth_method: 0,
             form_username: String::new(),
-            form_password: String::new(),
-            form_token: String::new(),
+            form_password: Zeroizing::new(String::new()),
+            form_token: Zeroizing::new(String::new()),
             form_color: "#1a73e8".into(),
             form_oidc_issuer: String::new(),
             form_oidc_client_id: String::new(),
-            form_oidc_client_secret: String::new(),
+            form_oidc_client_secret: Zeroizing::new(String::new()),
             form_oidc_scopes: "openid".into(),
             form_ca_cert_path: String::new(),
             form_discovered_calendars: Vec::new(),
