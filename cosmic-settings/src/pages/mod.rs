@@ -39,6 +39,8 @@ pub enum Message {
     Applications(applications::Message),
     #[cfg(feature = "page-bluetooth")]
     Bluetooth(bluetooth::Message),
+    #[cfg(feature = "page-calendar")]
+    Calendar(time::calendar::Message),
     #[cfg(feature = "page-input")]
     CustomShortcuts(input::keyboard::shortcuts::custom::Message),
     #[cfg(feature = "page-date")]

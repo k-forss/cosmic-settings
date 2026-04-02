@@ -3,6 +3,8 @@
 
 use cosmic_settings_page as page;
 
+#[cfg(feature = "page-calendar")]
+pub mod calendar;
 #[cfg(feature = "page-date")]
 pub mod date;
 #[cfg(feature = "page-region")]
@@ -32,6 +34,11 @@ impl page::AutoBind<crate::pages::Message> for Page {
         #[cfg(feature = "page-date")]
         {
             page = page.sub_page::<date::Page>();
+        }
+
+        #[cfg(feature = "page-calendar")]
+        {
+            page = page.sub_page::<calendar::Page>();
         }
 
         #[cfg(feature = "page-region")]

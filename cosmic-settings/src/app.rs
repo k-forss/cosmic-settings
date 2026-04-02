@@ -448,6 +448,13 @@ impl cosmic::Application for SettingsApp {
                     }
                 }
 
+                #[cfg(feature = "page-calendar")]
+                crate::pages::Message::Calendar(message) => {
+                    if let Some(page) = self.pages.page_mut::<time::calendar::Page>() {
+                        return page.update(message).map(Into::into);
+                    }
+                }
+
                 #[cfg(feature = "page-date")]
                 crate::pages::Message::DateAndTime(message) => {
                     if let Some(page) = self.pages.page_mut::<time::date::Page>() {
